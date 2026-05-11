@@ -12,6 +12,8 @@ import {
 } from '@discordjs/voice';
 import { Client, VoiceChannel } from 'discord.js';
 import { Readable } from 'stream';
+import * as https from 'https';
+import * as http from 'http';
 import { logger } from './logger';
 import { config } from './config';
 import * as googleTTS from 'google-tts-api';
@@ -122,7 +124,7 @@ export class VoiceManager {
     }
   }
 
-  private playNextTTS() {
+  private async playNextTTS() {
     const url = this.ttsQueue.shift();
     if (!url) {
       this.isPlayingTTS = false;
@@ -132,14 +134,45 @@ export class VoiceManager {
 
     this.isPlayingTTS = true;
     try {
-      const resource = createAudioResource(url, {
+      logger.debug(`Fetching TTS audio from URL...`);
+      const audioBuffer = await this.fetchAudioBuffer(url);
+      const readable = Readable.from(audioBuffer);
+      const resource = createAudioResource(readable, {
         inputType: StreamType.Arbitrary,
       });
       this.player.play(resource);
+      logger.debug('Playing TTS audio from buffer.');
     } catch (error) {
       logger.error(error, 'Failed to play next TTS queue item');
+      this.isPlayingTTS = false;
       this.player.emit(AudioPlayerStatus.Idle, this.player.state, this.player.state);
     }
+  }
+
+  private fetchAudioBuffer(url: string): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const protocol = url.startsWith('https') ? https : http;
+      const options = {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Referer': 'https://translate.google.com/',
+        },
+      };
+      protocol.get(url, options, (res) => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          // Handle redirect
+          return this.fetchAudioBuffer(res.headers.location).then(resolve).catch(reject);
+        }
+        if (res.statusCode !== 200) {
+          return reject(new Error(`TTS fetch failed with status: ${res.statusCode}`));
+        }
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
+      }).on('error', reject);
+    });
   }
 
   public async speak(text: string) {
