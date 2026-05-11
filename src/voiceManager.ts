@@ -31,13 +31,20 @@ export class VoiceManager {
       noSubscriber: NoSubscriberBehavior.Play,
     },
   });
+  private ttsQueue: string[] = [];
+  private isPlayingTTS = false;
 
   constructor(client: Client) {
     this.client = client;
 
-    // Restart silence if the player stops for some reason
+    // Restart silence if the player stops for some reason, or play next TTS
     this.player.on(AudioPlayerStatus.Idle, () => {
-      this.playSilence();
+      if (this.ttsQueue.length > 0) {
+        this.playNextTTS();
+      } else {
+        this.isPlayingTTS = false;
+        this.playSilence();
+      }
     });
 
     this.player.on('error', (error) => {
@@ -47,10 +54,12 @@ export class VoiceManager {
   }
 
   public async connectToChannel(channel: VoiceChannel) {
-    if (this.connection) {
-      logger.info('Already connected to a voice channel.');
+    if (this.connection && this.connection.joinConfig.channelId === channel.id) {
+      logger.info('Already connected to this voice channel.');
       return;
     }
+
+    const isNewConnection = !this.connection;
 
     this.connection = joinVoiceChannel({
       channelId: channel.id,
@@ -60,42 +69,44 @@ export class VoiceManager {
       selfMute: false,
     });
 
-    this.connection.on(VoiceConnectionStatus.Disconnected, async (oldState, newState) => {
-      try {
-        await Promise.race([
-          entersState(this.connection!, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(this.connection!, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-        // Seems to be reconnecting to a new channel - ignore disconnect
-        logger.info('Connection seems to be reconnecting automatically.');
-      } catch (error) {
-        // Seems to be a real disconnect which shouldn't be recovered automatically
-        logger.warn('Disconnected from voice channel. Attempting to reconnect...');
+    if (isNewConnection) {
+      this.connection.on(VoiceConnectionStatus.Disconnected, async (oldState, newState) => {
+        try {
+          await Promise.race([
+            entersState(this.connection!, VoiceConnectionStatus.Signalling, 5_000),
+            entersState(this.connection!, VoiceConnectionStatus.Connecting, 5_000),
+          ]);
+          logger.info('Connection seems to be reconnecting automatically.');
+        } catch (error) {
+          logger.warn('Disconnected from voice channel. Attempting to reconnect...');
+          this.destroyConnection();
+          this.reconnect();
+        }
+      });
+
+      this.connection.on(VoiceConnectionStatus.Destroyed, () => {
+        logger.warn('Voice connection destroyed.');
         this.destroyConnection();
         this.reconnect();
+      });
+
+      this.connection.on('error', (error) => {
+        logger.error(error, 'Voice connection error');
+      });
+
+      try {
+        await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
+        logger.info('Successfully connected to voice channel!');
+        
+        this.connection.subscribe(this.player);
+        this.playSilence();
+      } catch (error) {
+        logger.error(error, 'Failed to connect to voice channel within 20 seconds');
+        this.destroyConnection();
+        setTimeout(() => this.reconnect(), 5000);
       }
-    });
-
-    this.connection.on(VoiceConnectionStatus.Destroyed, () => {
-      logger.warn('Voice connection destroyed.');
-      this.destroyConnection();
-      this.reconnect();
-    });
-
-    this.connection.on('error', (error) => {
-      logger.error(error, 'Voice connection error');
-    });
-
-    try {
-      await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
-      logger.info('Successfully connected to voice channel!');
-      
-      this.connection.subscribe(this.player);
-      this.playSilence();
-    } catch (error) {
-      logger.error(error, 'Failed to connect to voice channel within 20 seconds');
-      this.destroyConnection();
-      setTimeout(() => this.reconnect(), 5000);
+    } else {
+      logger.info(`Moved to new voice channel: ${channel.name}`);
     }
   }
 
@@ -111,6 +122,26 @@ export class VoiceManager {
     }
   }
 
+  private playNextTTS() {
+    const url = this.ttsQueue.shift();
+    if (!url) {
+      this.isPlayingTTS = false;
+      this.playSilence();
+      return;
+    }
+
+    this.isPlayingTTS = true;
+    try {
+      const resource = createAudioResource(url, {
+        inputType: StreamType.Arbitrary,
+      });
+      this.player.play(resource);
+    } catch (error) {
+      logger.error(error, 'Failed to play next TTS queue item');
+      this.player.emit(AudioPlayerStatus.Idle, this.player.state, this.player.state);
+    }
+  }
+
   public async speak(text: string) {
     if (!this.connection) {
       logger.warn('Cannot speak, not connected to a voice channel.');
@@ -118,20 +149,22 @@ export class VoiceManager {
     }
 
     try {
-      const url = googleTTS.getAudioUrl(text, {
-        lang: 'en',
+      const results = googleTTS.getAllAudioUrls(text, {
+        lang: 'id',
         slow: false,
         host: 'https://translate.google.com',
+        splitPunct: ',.?',
       });
       
-      const resource = createAudioResource(url, {
-        inputType: StreamType.Arbitrary,
-      });
-      
-      this.player.play(resource);
+      this.ttsQueue.push(...results.map(r => r.url));
       logger.info(`Speaking: ${text}`);
+
+      if (!this.isPlayingTTS) {
+        this.playNextTTS();
+      }
     } catch (error) {
       logger.error(error, 'Failed to speak text');
+      this.isPlayingTTS = false;
       this.playSilence();
     }
   }
