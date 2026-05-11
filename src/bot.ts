@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, VoiceChannel } from 'discord.js';
+import { Client, GatewayIntentBits, VoiceChannel, Message } from 'discord.js';
 import { logger } from './logger';
 import { config } from './config';
 import { VoiceManager } from './voiceManager';
@@ -7,6 +7,8 @@ export const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
   ],
 });
 
@@ -26,6 +28,17 @@ client.once('ready', async () => {
     }
   } catch (error) {
     logger.error(error, 'Failed to fetch guild or channel on startup');
+  }
+});
+
+client.on('messageCreate', async (message: Message) => {
+  if (message.author.bot) return;
+
+  if (message.content.startsWith('!speak ')) {
+    const text = message.content.slice(7).trim();
+    if (text) {
+      voiceManager.speak(text);
+    }
   }
 });
 

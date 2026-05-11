@@ -14,6 +14,7 @@ import { Client, VoiceChannel } from 'discord.js';
 import { Readable } from 'stream';
 import { logger } from './logger';
 import { config } from './config';
+import * as googleTTS from 'google-tts-api';
 
 class SilenceStream extends Readable {
   _read() {
@@ -107,6 +108,31 @@ export class VoiceManager {
       logger.debug('Started playing silent audio stream to prevent idle disconnect.');
     } catch (error) {
       logger.error(error, 'Failed to play silence');
+    }
+  }
+
+  public async speak(text: string) {
+    if (!this.connection) {
+      logger.warn('Cannot speak, not connected to a voice channel.');
+      return;
+    }
+
+    try {
+      const url = googleTTS.getAudioUrl(text, {
+        lang: 'en',
+        slow: false,
+        host: 'https://translate.google.com',
+      });
+      
+      const resource = createAudioResource(url, {
+        inputType: StreamType.Arbitrary,
+      });
+      
+      this.player.play(resource);
+      logger.info(`Speaking: ${text}`);
+    } catch (error) {
+      logger.error(error, 'Failed to speak text');
+      this.playSilence();
     }
   }
 
