@@ -18,13 +18,6 @@ import { logger } from './logger';
 import { config } from './config';
 import * as googleTTS from 'google-tts-api';
 
-class SilenceStream extends Readable {
-  _read() {
-    // 20ms of silence at 48kHz, 2 channels, 16-bit
-    this.push(Buffer.alloc(960 * 2 * 2));
-  }
-}
-
 export class VoiceManager {
   private client: Client;
   private connection: VoiceConnection | null = null;
@@ -35,23 +28,27 @@ export class VoiceManager {
   });
   private ttsQueue: string[] = [];
   private isPlayingTTS = false;
+  private activeMusicRequest: http.ClientRequest | null = null;
 
   constructor(client: Client) {
     this.client = client;
 
-    // Restart silence if the player stops for some reason, or play next TTS
+    // Play next TTS or return to idle music stream
     this.player.on(AudioPlayerStatus.Idle, () => {
       if (this.ttsQueue.length > 0) {
         this.playNextTTS();
       } else {
         this.isPlayingTTS = false;
-        this.playSilence();
+        this.playMusicStream();
       }
     });
 
     this.player.on('error', (error) => {
       logger.error(error, 'AudioPlayer error');
-      this.playSilence();
+      // Only attempt to resume if we're not actively transitioning to or playing TTS
+      if (!this.isPlayingTTS && this.ttsQueue.length === 0) {
+        this.playMusicStream();
+      }
     });
   }
 
@@ -101,7 +98,7 @@ export class VoiceManager {
         logger.info('Successfully connected to voice channel!');
         
         this.connection.subscribe(this.player);
-        this.playSilence();
+        this.playMusicStream();
       } catch (error) {
         logger.error(error, 'Failed to connect to voice channel within 20 seconds');
         this.destroyConnection();
@@ -112,15 +109,68 @@ export class VoiceManager {
     }
   }
 
-  private playSilence() {
+  private playMusicStream() {
+    this.playMusicStreamWithUrl(config.STREAM_URL);
+  }
+
+  private playMusicStreamWithUrl(url: string) {
+    if (this.isPlayingTTS || this.ttsQueue.length > 0) {
+      return;
+    }
+
+    // Cleanup existing request to avoid leaks
+    this.cleanupMusicStream();
+
     try {
-      const resource = createAudioResource(new SilenceStream(), {
-        inputType: StreamType.Raw,
+      const protocol = url.startsWith('https') ? https : http;
+      logger.debug(`Attempting to stream music from: ${url}`);
+
+      this.activeMusicRequest = protocol.get(url, (res) => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          logger.debug(`Redirecting music stream to ${res.headers.location}`);
+          this.playMusicStreamWithUrl(res.headers.location);
+          return;
+        }
+
+        if (res.statusCode !== 200) {
+          logger.error(`Failed to stream music. HTTP Status: ${res.statusCode}`);
+          // Wait and retry
+          setTimeout(() => this.playMusicStream(), 10000);
+          return;
+        }
+
+        const resource = createAudioResource(res, {
+          inputType: StreamType.Arbitrary,
+        });
+
+        this.player.play(resource);
+        logger.debug('Successfully started playing idle music stream.');
       });
-      this.player.play(resource);
-      logger.debug('Started playing silent audio stream to prevent idle disconnect.');
+
+      this.activeMusicRequest.on('error', (err) => {
+        logger.error(err, 'Music stream HTTP request error');
+        this.cleanupMusicStream();
+        setTimeout(() => this.playMusicStream(), 10000);
+      });
     } catch (error) {
-      logger.error(error, 'Failed to play silence');
+      logger.error(error, 'Failed to initiate music stream');
+      this.cleanupMusicStream();
+      setTimeout(() => this.playMusicStream(), 10000);
+    }
+  }
+
+  private cleanupMusicStream() {
+    if (this.activeMusicRequest) {
+      try {
+        // Remove error listeners and attach a dummy one to absorb the ECONNRESET (socket hang up)
+        // event triggered by intentional destruction, avoiding noisy loggers/retries.
+        this.activeMusicRequest.removeAllListeners('error');
+        this.activeMusicRequest.on('error', () => {}); 
+        this.activeMusicRequest.destroy();
+      } catch (err) {
+        // Ignore cleanup errors
+      }
+      this.activeMusicRequest = null;
     }
   }
 
@@ -128,11 +178,16 @@ export class VoiceManager {
     const url = this.ttsQueue.shift();
     if (!url) {
       this.isPlayingTTS = false;
-      this.playSilence();
+      this.playMusicStream();
       return;
     }
 
+    // Mark as playing TTS BEFORE we trigger any shutdowns to keep states aligned
     this.isPlayingTTS = true;
+
+    // Explicitly clean up ongoing music connection when playing TTS
+    this.cleanupMusicStream();
+
     try {
       logger.debug(`Fetching TTS audio from URL...`);
       const audioBuffer = await this.fetchAudioBuffer(url);
@@ -198,7 +253,7 @@ export class VoiceManager {
     } catch (error) {
       logger.error(error, 'Failed to speak text');
       this.isPlayingTTS = false;
-      this.playSilence();
+      this.playMusicStream();
     }
   }
 
