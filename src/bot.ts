@@ -34,7 +34,7 @@ client.once('ready', async () => {
 client.on('messageCreate', async (message: Message) => {
   if (message.author.bot) return;
 
-  if (message.content === '!join') {
+  if (message.content === '/vdh join') {
     const member = message.member;
     if (member && member.voice.channel) {
       voiceManager.connectToChannel(member.voice.channel as VoiceChannel);
@@ -45,8 +45,8 @@ client.on('messageCreate', async (message: Message) => {
     return;
   }
 
-  if (message.content.startsWith('!speak ')) {
-    const text = message.content.slice(7).trim();
+  if (message.content.startsWith('/vdh speak ')) {
+    const text = message.content.slice(11).trim();
     if (text.toLowerCase() === 'kata kata hari ini') {
       const quotes = [
         "Jangan pernah menyerah, karena setiap tetes keringatmu akan berbuah manis.",
